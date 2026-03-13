@@ -62,7 +62,7 @@ Then open `http://localhost:8085`.
 
 The runtime now enables the fastest browser CPU path that `onnxruntime-web` can use automatically:
 
-- **WASM SIMD** is enabled by default to take advantage of vectorized CPU execution. On modern x86 browsers this is the closest browser equivalent to taking advantage of **AVX2-class** hardware.
+- **WASM SIMD** is enabled by default to take advantage of vectorized CPU execution, which improves performance on modern browsers running on CPUs with strong SIMD support such as AVX2-capable x86 processors.
 - **Threaded WASM** is enabled automatically when the page is served in a **cross-origin isolated** context, so multi-core CPUs can be used for inference.
 - If you are running with a native ONNX Runtime binding that exposes **OpenVINO**, you can request it explicitly with `?ep=openvino,wasm` and the app will fall back to WASM if OpenVINO is unavailable.
 

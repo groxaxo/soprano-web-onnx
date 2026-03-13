@@ -653,6 +653,8 @@ class SopranoONNXStreaming {
         this._topKScores = null;
         this._topKOrder = null;
         this._topKExp = null;
+        this._decoderInputBuffer = new Float32Array(DECODER_HIDDEN_DIM * MAX_HIDDEN_WINDOW);
+        this._hiddenStatePool = Array.from({ length: MAX_HIDDEN_WINDOW }, () => new Float32Array(DECODER_HIDDEN_DIM));
         this.executionProvider = 'wasm';
         this.runtimeConfig = this.configureRuntime();
 
@@ -776,11 +778,13 @@ class SopranoONNXStreaming {
 
     configureRuntime() {
         const wasmEnv = globalThis.ort?.env?.wasm;
-        const hardwareThreads = Math.max(1, Math.floor(globalThis.navigator?.hardwareConcurrency || 1));
+        const hardwareThreads = Math.max(1, globalThis.navigator?.hardwareConcurrency || 1);
         const canUseThreadedWasm = Boolean(globalThis.crossOriginIsolated && hardwareThreads > 1);
         const numThreads = wasmEnv ? (canUseThreadedWasm ? Math.min(hardwareThreads, MAX_WASM_THREADS) : 1) : 0;
 
         if (wasmEnv) {
+            // ORT exposes `env.wasm` only for builds that support the WASM backend, so enabling
+            // SIMD here allows the runtime to pick the fastest compatible WASM binary automatically.
             wasmEnv.simd = true;
             if ('numThreads' in wasmEnv) wasmEnv.numThreads = numThreads;
             if ('proxy' in wasmEnv) wasmEnv.proxy = canUseThreadedWasm;
@@ -832,7 +836,12 @@ class SopranoONNXStreaming {
     formatProviderLabel(provider = this.executionProvider) {
         if (provider === 'openvino') return 'OpenVINO';
         if (provider === 'wasm') {
-            const threadSuffix = this.runtimeConfig.numThreads > 1 ? ` SIMD x${this.runtimeConfig.numThreads}` : (this.runtimeConfig.simd ? ' SIMD' : '');
+            let threadSuffix = '';
+            if (this.runtimeConfig.numThreads > 1) {
+                threadSuffix = ` SIMD x${this.runtimeConfig.numThreads}`;
+            } else if (this.runtimeConfig.simd) {
+                threadSuffix = ' SIMD';
+            }
             return `WASM${threadSuffix}`;
         }
         return String(provider).toUpperCase();
@@ -989,7 +998,8 @@ class SopranoONNXStreaming {
 	        let currentPositionIds = new ort.Tensor('int64', BigInt64Array.from({ length: promptLen }, (_, i) => BigInt(i)), [batch, promptLen]);
 
 	        const hiddenStatesBuffer = [];
-        const decoderInputBuffer = new Float32Array(DECODER_HIDDEN_DIM * MAX_HIDDEN_WINDOW);
+        let hiddenStatePoolIndex = 0;
+        const decoderInputBuffer = this._decoderInputBuffer;
 	        let totalSamples = 0;
 
 	        let chunkCounter = TARGET_CHUNK_SIZE;
@@ -1043,14 +1053,11 @@ class SopranoONNXStreaming {
             const lastTokenStart = (seqLen - 1) * DECODER_HIDDEN_DIM;
 
             if (i > 0 && !finished) {
-                const lastTokenState = new Float32Array(DECODER_HIDDEN_DIM);
+                const lastTokenState = hiddenStatesBuffer.length === MAX_HIDDEN_WINDOW
+                    ? hiddenStatesBuffer.shift()
+                    : this._hiddenStatePool[hiddenStatePoolIndex++];
                 lastTokenState.set(lastHiddenState.data.subarray(lastTokenStart, lastTokenStart + DECODER_HIDDEN_DIM));
                 hiddenStatesBuffer.push(lastTokenState);
-            }
-
-            // Trim buffer
-            if (hiddenStatesBuffer.length > MAX_HIDDEN_WINDOW) {
-                hiddenStatesBuffer.splice(0, hiddenStatesBuffer.length - MAX_HIDDEN_WINDOW);
             }
 
             // Decode trigger
