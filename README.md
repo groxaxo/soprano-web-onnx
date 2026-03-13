@@ -1,4 +1,4 @@
-# Soprano ONNX Streaming — Instant Text‑to‑Speech in the Browser (WASM)
+# Soprano ONNX Streaming — Instant Text‑to‑Speech in the Browser (CPU-Optimized WASM)
 
 [![Upstream](https://img.shields.io/badge/Upstream-ekwek1%2Fsoprano-black?logo=github)](https://github.com/ekwek1/soprano)
 [![Hugging Face Model](https://img.shields.io/badge/HuggingFace-Model-orange?logo=huggingface)](https://huggingface.co/KevinAHM/soprano-onnx)
@@ -58,6 +58,21 @@ python -m http.server 8085
 
 Then open `http://localhost:8085`.
 
+### For maximum CPU throughput
+
+The runtime now enables the fastest browser CPU path that `onnxruntime-web` can use automatically:
+
+- **WASM SIMD** is enabled by default to take advantage of vectorized CPU execution, which improves performance on modern browsers running on CPUs with strong SIMD support such as AVX2-capable x86 processors.
+- **Threaded WASM** is enabled automatically when the page is served in a **cross-origin isolated** context, so multi-core CPUs can be used for inference.
+- If you are running with a native ONNX Runtime binding that exposes **OpenVINO**, you can request it explicitly with `?ep=openvino,wasm` and the app will fall back to WASM if OpenVINO is unavailable.
+
+To unlock threaded WASM in browsers, serve the app with these response headers:
+
+```text
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: require-corp
+```
+
 ---
 
 ## Configuration
@@ -70,6 +85,12 @@ Sampling defaults are set in `onnx-streaming.js` (constructor):
 - `topP`
 - `repetitionPenalty`
 
+Runtime defaults are also tuned in `onnx-streaming.js` for CPU inference:
+- `ort.env.wasm.simd = true`
+- `ort.env.wasm.numThreads` is auto-sized from `navigator.hardwareConcurrency` when cross-origin isolation is available
+- `graphOptimizationLevel = 'all'`
+- inference yields to the UI less frequently and reuses decode buffers to reduce per-token overhead
+
 ---
 
 ## Troubleshooting
@@ -79,8 +100,10 @@ Sampling defaults are set in `onnx-streaming.js` (constructor):
   - Check DevTools → Network for a missing `.onnx.data` file (404)
   - Confirm `/` contains `tokenizer.json` (and related files)
 - **Performance notes**
-  - Both backbone and decoder run on WASM/CPU
-  - Achieves real-time streaming on modern hardware
+  - Both backbone and decoder run on CPU-oriented execution providers
+  - Browser builds prefer tuned **WASM SIMD** and will use multithreaded WASM when the page is cross-origin isolated
+  - Native environments can opt into **OpenVINO** with `?ep=openvino,wasm`
+  - Achieves better real-time streaming on modern hardware by reducing per-token JS overhead
 
 ---
 
