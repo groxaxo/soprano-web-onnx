@@ -10,6 +10,15 @@ const MODELS = {
 const RECEPTIVE_FIELD = 4;
 const TOKEN_SIZE = 2048;
 const SAMPLE_RATE = 32000;
+const NUM_LAYERS = 17;
+const KV_HIDDEN_DIM = 128;
+const DECODER_HIDDEN_DIM = 512;
+const VOCAB_SIZE = 8192;
+const MAX_NEW_TOKENS = 512;
+const TARGET_CHUNK_SIZE = 8;
+const MAX_HIDDEN_WINDOW = 2 * RECEPTIVE_FIELD + TARGET_CHUNK_SIZE;
+const TOKEN_YIELD_INTERVAL = 16;
+const MAX_WASM_THREADS = 8;
 
 // ============================================
 // Text Preprocessing (ported from soprano/utils/text.py)
@@ -644,12 +653,15 @@ class SopranoONNXStreaming {
         this._topKScores = null;
         this._topKOrder = null;
         this._topKExp = null;
+        this.executionProvider = 'wasm';
+        this.runtimeConfig = this.configureRuntime();
 
         this.init();
     }
 
     async init() {
         console.log('SopranoONNXStreaming v3.0 - Neural Observatory Edition');
+        console.log('ONNX Runtime CPU profile:', this.runtimeConfig);
         this.updateStatus('Initializing...', 'running');
 
         try {
@@ -762,6 +774,70 @@ class SopranoONNXStreaming {
         }
     }
 
+    configureRuntime() {
+        const wasmEnv = globalThis.ort?.env?.wasm;
+        const hardwareThreads = Math.max(1, Math.floor(globalThis.navigator?.hardwareConcurrency || 1));
+        const canUseThreadedWasm = Boolean(globalThis.crossOriginIsolated && hardwareThreads > 1);
+        const numThreads = wasmEnv ? (canUseThreadedWasm ? Math.min(hardwareThreads, MAX_WASM_THREADS) : 1) : 0;
+
+        if (wasmEnv) {
+            wasmEnv.simd = true;
+            if ('numThreads' in wasmEnv) wasmEnv.numThreads = numThreads;
+            if ('proxy' in wasmEnv) wasmEnv.proxy = canUseThreadedWasm;
+        }
+
+        return {
+            simd: Boolean(wasmEnv),
+            proxy: Boolean(wasmEnv?.proxy),
+            numThreads,
+            hardwareThreads,
+            crossOriginIsolated: Boolean(globalThis.crossOriginIsolated)
+        };
+    }
+
+    getExecutionProviderCandidates() {
+        const requestedProviders = new URLSearchParams(globalThis.location?.search || '')
+            .get('ep')
+            ?.split(',')
+            .map(provider => provider.trim().toLowerCase())
+            .filter(Boolean) || [];
+
+        const candidates = [];
+        const seen = new Set();
+        const addCandidate = (provider) => {
+            if (provider && !seen.has(provider)) {
+                seen.add(provider);
+                candidates.push(provider);
+            }
+        };
+
+        requestedProviders.forEach(addCandidate);
+
+        // When using a native ORT binding, OpenVINO may be available; otherwise fall back to tuned WASM.
+        if (!globalThis.ort?.env?.wasm) addCandidate('openvino');
+        addCandidate('wasm');
+
+        return candidates;
+    }
+
+    createSessionOptions(provider, extraOptions = {}) {
+        return {
+            executionProviders: [provider],
+            freeDimensionOverrides: { 'batch': 1 },
+            graphOptimizationLevel: 'all',
+            ...extraOptions
+        };
+    }
+
+    formatProviderLabel(provider = this.executionProvider) {
+        if (provider === 'openvino') return 'OpenVINO';
+        if (provider === 'wasm') {
+            const threadSuffix = this.runtimeConfig.numThreads > 1 ? ` SIMD x${this.runtimeConfig.numThreads}` : (this.runtimeConfig.simd ? ' SIMD' : '');
+            return `WASM${threadSuffix}`;
+        }
+        return String(provider).toUpperCase();
+    }
+
     async loadModels() {
         if (this.backboneSession) return;
 
@@ -771,31 +847,41 @@ class SopranoONNXStreaming {
         this.elements.generateBtn.disabled = true;
 
         try {
-            const backboneOptions = {
-                executionProviders: ['wasm'],
-                freeDimensionOverrides: { 'batch': 1 },
-                graphOptimizationLevel: 'all'
-            };
-
-            console.log('Loading backbone + decoder (WASM)...');
-            this.backboneSession = await ort.InferenceSession.create(MODELS.backbone, backboneOptions);
-
-            // Decoder with external data
             const dataUrl = MODELS.decoder + '.data';
             const [decoderBuf, dataBuf] = await Promise.all([
                 fetch(MODELS.decoder).then(r => r.arrayBuffer()),
                 fetch(dataUrl).then(r => r.arrayBuffer())
             ]);
+            const decoderModel = new Uint8Array(decoderBuf);
+            const decoderWeights = new Uint8Array(dataBuf);
 
-            const decoderOptions = {
-                executionProviders: ['wasm'],
-                freeDimensionOverrides: { 'batch': 1 },
-                externalData: [{ data: new Uint8Array(dataBuf), path: 'soprano_decoder.onnx.data' }]
-            };
-            this.decoderSession = await ort.InferenceSession.create(new Uint8Array(decoderBuf), decoderOptions);
+            let loadError = null;
+            for (const provider of this.getExecutionProviderCandidates()) {
+                try {
+                    console.log(`Loading backbone + decoder (${this.formatProviderLabel(provider)})...`);
+                    this.backboneSession = await ort.InferenceSession.create(
+                        MODELS.backbone,
+                        this.createSessionOptions(provider)
+                    );
+                    this.decoderSession = await ort.InferenceSession.create(
+                        decoderModel,
+                        this.createSessionOptions(provider, {
+                            externalData: [{ data: decoderWeights, path: 'soprano_decoder.onnx.data' }]
+                        })
+                    );
+                    this.executionProvider = provider;
+                    this.updateModelStatus('ready', `Ready · ${this.formatProviderLabel(provider)}`);
+                    console.log(`Models loaded successfully with ${this.formatProviderLabel(provider)}.`);
+                    return;
+                } catch (err) {
+                    loadError = err;
+                    this.backboneSession = null;
+                    this.decoderSession = null;
+                    console.warn(`Failed to load models with ${provider}, trying next provider...`, err);
+                }
+            }
 
-            this.updateModelStatus('ready', 'Ready');
-            console.log('Models loaded successfully.');
+            throw loadError || new Error('No compatible execution provider could be initialized');
         } catch (err) {
             console.error('Model loading failed:', err);
             this.updateModelStatus('error', 'Load failed');
@@ -868,30 +954,26 @@ class SopranoONNXStreaming {
 
 	    async generationLoop(promptTokens, startTime, isFirstBatch = true, cumulativeSamples = 0) {
 	        const batch = 1;
-	        const numLayers = 17;
-	        const hiddenDim = 128;
 	        const promptLen = promptTokens.length;
-	        const vocabSize = 8192;
-	        const maxNewTokens = 512;
 
 	        // Track unique tokens for repetition penalty (HF behavior: includes prompt tokens by default).
-	        const seenTokenMask = new Uint8Array(vocabSize);
+	        const seenTokenMask = new Uint8Array(VOCAB_SIZE);
 	        for (let i = 0; i < promptTokens.length; i++) {
 	            const tid = Number(promptTokens[i]);
-            if (tid >= 0 && tid < vocabSize && seenTokenMask[tid] === 0) {
+            if (tid >= 0 && tid < VOCAB_SIZE && seenTokenMask[tid] === 0) {
                 seenTokenMask[tid] = 1;
             }
         }
 
         // Initialize KV cache
         let pastKeyValues = {};
-	        for (let i = 0; i < numLayers; i++) {
-	            pastKeyValues[`past_key_values.${i}.key`] = new ort.Tensor('float32', new Float32Array(0), [batch, 1, 0, hiddenDim]);
-	            pastKeyValues[`past_key_values.${i}.value`] = new ort.Tensor('float32', new Float32Array(0), [batch, 1, 0, hiddenDim]);
+	        for (let i = 0; i < NUM_LAYERS; i++) {
+	            pastKeyValues[`past_key_values.${i}.key`] = new ort.Tensor('float32', new Float32Array(0), [batch, 1, 0, KV_HIDDEN_DIM]);
+	            pastKeyValues[`past_key_values.${i}.value`] = new ort.Tensor('float32', new Float32Array(0), [batch, 1, 0, KV_HIDDEN_DIM]);
 	        }
 
 	        // Preallocate attention mask buffer once (avoid O(seq_len) alloc per token).
-	        const maxSeqLen = promptLen + maxNewTokens;
+	        const maxSeqLen = promptLen + MAX_NEW_TOKENS;
 	        const attentionMaskData = new BigInt64Array(maxSeqLen);
 	        attentionMaskData.fill(1n);
 	        let currentSeqLen = promptLen;
@@ -907,84 +989,95 @@ class SopranoONNXStreaming {
 	        let currentPositionIds = new ort.Tensor('int64', BigInt64Array.from({ length: promptLen }, (_, i) => BigInt(i)), [batch, promptLen]);
 
 	        const hiddenStatesBuffer = [];
+        const decoderInputBuffer = new Float32Array(DECODER_HIDDEN_DIM * MAX_HIDDEN_WINDOW);
 	        let totalSamples = 0;
 
-	        const targetChunkSize = 8;
-	        let chunkCounter = targetChunkSize;
+	        let chunkCounter = TARGET_CHUNK_SIZE;
 	        let firstChunk = true;
+        const backboneNames = this.backboneSession.outputNames;
+        const decoderInputName = this.decoderSession.inputNames[0];
+        const decoderOutputName = this.decoderSession.outputNames[0];
+        const inputs = {
+            input_ids: currentInputIds,
+            attention_mask: currentAttentionMask,
+            position_ids: currentPositionIds,
+            ...pastKeyValues
+        };
 
-        for (let i = 0; i < maxNewTokens; i++) {
+        for (let i = 0; i < MAX_NEW_TOKENS; i++) {
             if (!this.isGenerating) break;
 
-            // Yield to main thread
-            await new Promise(resolve => setTimeout(resolve, 0));
+            if (i > 0 && (i % TOKEN_YIELD_INTERVAL) === 0) {
+                await new Promise(resolve => setTimeout(resolve, 0));
+            }
 
-            const inputs = {
-                input_ids: currentInputIds,
-                attention_mask: currentAttentionMask,
-                position_ids: currentPositionIds,
-                ...pastKeyValues
-            };
+            inputs.input_ids = currentInputIds;
+            inputs.attention_mask = currentAttentionMask;
+            inputs.position_ids = currentPositionIds;
 
             const outputs = await this.backboneSession.run(inputs);
 
-            const backboneNames = this.backboneSession.outputNames;
             const logits = outputs[backboneNames[0]];
             const lastHiddenState = outputs[backboneNames[backboneNames.length - 1]];
 
             // Update KV cache
-            for (let j = 0; j < numLayers; j++) {
-                pastKeyValues[`past_key_values.${j}.key`] = outputs[backboneNames[1 + j * 2]];
-                pastKeyValues[`past_key_values.${j}.value`] = outputs[backboneNames[2 + j * 2]];
+            for (let j = 0; j < NUM_LAYERS; j++) {
+                const keyName = `past_key_values.${j}.key`;
+                const valueName = `past_key_values.${j}.value`;
+                pastKeyValues[keyName] = outputs[backboneNames[1 + j * 2]];
+                pastKeyValues[valueName] = outputs[backboneNames[2 + j * 2]];
+                inputs[keyName] = pastKeyValues[keyName];
+                inputs[valueName] = pastKeyValues[valueName];
             }
 
             // Sample next token
             const nextTokenId = this.sample(logits, seenTokenMask);
             const finished = (nextTokenId === 3n);
             const nextTokenIdNum = Number(nextTokenId);
-            if (nextTokenIdNum >= 0 && nextTokenIdNum < vocabSize && seenTokenMask[nextTokenIdNum] === 0) {
+            if (nextTokenIdNum >= 0 && nextTokenIdNum < VOCAB_SIZE && seenTokenMask[nextTokenIdNum] === 0) {
                 seenTokenMask[nextTokenIdNum] = 1;
             }
 
             // Extract hidden state
             const seqLen = lastHiddenState.dims[1];
-            const hiddenDimSize = lastHiddenState.dims[2];
-            const lastTokenState = lastHiddenState.data.slice((seqLen - 1) * hiddenDimSize, seqLen * hiddenDimSize);
+            const lastTokenStart = (seqLen - 1) * DECODER_HIDDEN_DIM;
 
             if (i > 0 && !finished) {
-                hiddenStatesBuffer.push(new Float32Array(lastTokenState));
+                const lastTokenState = new Float32Array(DECODER_HIDDEN_DIM);
+                lastTokenState.set(lastHiddenState.data.subarray(lastTokenStart, lastTokenStart + DECODER_HIDDEN_DIM));
+                hiddenStatesBuffer.push(lastTokenState);
             }
 
             // Trim buffer
-            if (hiddenStatesBuffer.length > 2 * RECEPTIVE_FIELD + targetChunkSize) {
-                hiddenStatesBuffer.splice(0, hiddenStatesBuffer.length - (2 * RECEPTIVE_FIELD + targetChunkSize));
+            if (hiddenStatesBuffer.length > MAX_HIDDEN_WINDOW) {
+                hiddenStatesBuffer.splice(0, hiddenStatesBuffer.length - MAX_HIDDEN_WINDOW);
             }
 
             // Decode trigger
-            if (finished || hiddenStatesBuffer.length >= RECEPTIVE_FIELD + targetChunkSize) {
-                if (finished || chunkCounter === targetChunkSize) {
+            if (finished || hiddenStatesBuffer.length >= RECEPTIVE_FIELD + TARGET_CHUNK_SIZE) {
+                if (finished || chunkCounter === TARGET_CHUNK_SIZE) {
                     const window = hiddenStatesBuffer.slice(-hiddenStatesBuffer.length);
                     const currentWindowSize = window.length;
 
-                    const decoderInput = new Float32Array(512 * currentWindowSize);
+                    const decoderInput = decoderInputBuffer.subarray(0, DECODER_HIDDEN_DIM * currentWindowSize);
                     for (let w = 0; w < currentWindowSize; w++) {
-                        for (let d = 0; d < 512; d++) {
+                        for (let d = 0; d < DECODER_HIDDEN_DIM; d++) {
                             decoderInput[d * currentWindowSize + w] = window[w][d];
                         }
                     }
 
                     const decoderOutputs = await this.decoderSession.run({
-                        [this.decoderSession.inputNames[0]]: new ort.Tensor('float32', decoderInput, [1, 512, currentWindowSize])
+                        [decoderInputName]: new ort.Tensor('float32', decoderInput, [1, DECODER_HIDDEN_DIM, currentWindowSize])
                     });
 
-                    const audio = decoderOutputs[this.decoderSession.outputNames[0]].data;
+                    const audio = decoderOutputs[decoderOutputName].data;
 
                     let audioChunk;
                     if (finished) {
                         const startIdx = audio.length - (RECEPTIVE_FIELD + chunkCounter - 1) * TOKEN_SIZE + TOKEN_SIZE;
                         audioChunk = audio.subarray(startIdx);
                     } else {
-                        const startIdx = audio.length - (RECEPTIVE_FIELD + targetChunkSize) * TOKEN_SIZE + TOKEN_SIZE;
+                        const startIdx = audio.length - (RECEPTIVE_FIELD + TARGET_CHUNK_SIZE) * TOKEN_SIZE + TOKEN_SIZE;
                         const endIdx = audio.length - RECEPTIVE_FIELD * TOKEN_SIZE + TOKEN_SIZE;
                         audioChunk = audio.subarray(startIdx, endIdx);
                     }
