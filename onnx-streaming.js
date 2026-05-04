@@ -10,6 +10,8 @@ const MODELS = {
 const RECEPTIVE_FIELD = 4;
 const TOKEN_SIZE = 2048;
 const SAMPLE_RATE = 32000;
+const TOKEN_YIELD_INTERVAL = 8;
+const MAX_WASM_THREADS = 6;
 
 // ============================================
 // Text Preprocessing (ported from soprano/utils/text.py)
@@ -644,8 +646,24 @@ class SopranoONNXStreaming {
         this._topKScores = null;
         this._topKOrder = null;
         this._topKExp = null;
+        this._ortConfigured = false;
+        this._ortThreads = 1;
 
         this.init();
+    }
+
+    configureOrtRuntime() {
+        if (this._ortConfigured || !globalThis.ort?.env?.wasm) return;
+
+        const cores = navigator.hardwareConcurrency || 1;
+        const usableThreads = Math.max(1, Math.min(MAX_WASM_THREADS, cores - 2 || 1));
+        this._ortThreads = globalThis.crossOriginIsolated ? usableThreads : 1;
+
+        ort.env.wasm.simd = true;
+        ort.env.wasm.numThreads = this._ortThreads;
+        this._ortConfigured = true;
+
+        console.log(`ONNX Runtime WASM configured: ${this._ortThreads} thread(s)`);
     }
 
     async init() {
@@ -653,6 +671,8 @@ class SopranoONNXStreaming {
         this.updateStatus('Initializing...', 'running');
 
         try {
+            this.configureOrtRuntime();
+
             // Initialize Audio Context and Player
             this.audioContext = new (window.AudioContext || window.webkitAudioContext)({
                 sampleRate: SAMPLE_RATE
@@ -764,6 +784,7 @@ class SopranoONNXStreaming {
 
     async loadModels() {
         if (this.backboneSession) return;
+        this.configureOrtRuntime();
 
         this.updateStatus('Loading models...', 'running');
         this.updateModelStatus('loading', 'Loading...');
@@ -910,14 +931,20 @@ class SopranoONNXStreaming {
 	        let totalSamples = 0;
 
 	        const targetChunkSize = 8;
+	        const maxHiddenStates = 2 * RECEPTIVE_FIELD + targetChunkSize;
 	        let chunkCounter = targetChunkSize;
 	        let firstChunk = true;
+	        let decoderInputBuffer = new Float32Array(512 * maxHiddenStates);
+            const backboneNames = this.backboneSession.outputNames;
+            const decoderInputName = this.decoderSession.inputNames[0];
+            const decoderOutputName = this.decoderSession.outputNames[0];
 
         for (let i = 0; i < maxNewTokens; i++) {
             if (!this.isGenerating) break;
 
-            // Yield to main thread
-            await new Promise(resolve => setTimeout(resolve, 0));
+            if (i > 0 && i % TOKEN_YIELD_INTERVAL === 0) {
+                await new Promise(resolve => setTimeout(resolve, 0));
+            }
 
             const inputs = {
                 input_ids: currentInputIds,
@@ -928,7 +955,6 @@ class SopranoONNXStreaming {
 
             const outputs = await this.backboneSession.run(inputs);
 
-            const backboneNames = this.backboneSession.outputNames;
             const logits = outputs[backboneNames[0]];
             const lastHiddenState = outputs[backboneNames[backboneNames.length - 1]];
 
@@ -949,35 +975,41 @@ class SopranoONNXStreaming {
             // Extract hidden state
             const seqLen = lastHiddenState.dims[1];
             const hiddenDimSize = lastHiddenState.dims[2];
-            const lastTokenState = lastHiddenState.data.slice((seqLen - 1) * hiddenDimSize, seqLen * hiddenDimSize);
 
             if (i > 0 && !finished) {
-                hiddenStatesBuffer.push(new Float32Array(lastTokenState));
+                const offset = (seqLen - 1) * hiddenDimSize;
+                const lastTokenState = new Float32Array(hiddenDimSize);
+                lastTokenState.set(lastHiddenState.data.subarray(offset, offset + hiddenDimSize));
+                hiddenStatesBuffer.push(lastTokenState);
             }
 
             // Trim buffer
-            if (hiddenStatesBuffer.length > 2 * RECEPTIVE_FIELD + targetChunkSize) {
-                hiddenStatesBuffer.splice(0, hiddenStatesBuffer.length - (2 * RECEPTIVE_FIELD + targetChunkSize));
+            if (hiddenStatesBuffer.length > maxHiddenStates) {
+                hiddenStatesBuffer.splice(0, hiddenStatesBuffer.length - maxHiddenStates);
             }
 
             // Decode trigger
             if (finished || hiddenStatesBuffer.length >= RECEPTIVE_FIELD + targetChunkSize) {
                 if (finished || chunkCounter === targetChunkSize) {
-                    const window = hiddenStatesBuffer.slice(-hiddenStatesBuffer.length);
-                    const currentWindowSize = window.length;
+                    const currentWindowSize = hiddenStatesBuffer.length;
 
-                    const decoderInput = new Float32Array(512 * currentWindowSize);
+                    const requiredDecoderFloats = 512 * currentWindowSize;
+                    if (decoderInputBuffer.length < requiredDecoderFloats) {
+                        decoderInputBuffer = new Float32Array(requiredDecoderFloats);
+                    }
+                    const decoderInput = decoderInputBuffer.subarray(0, requiredDecoderFloats);
                     for (let w = 0; w < currentWindowSize; w++) {
+                        const state = hiddenStatesBuffer[w];
                         for (let d = 0; d < 512; d++) {
-                            decoderInput[d * currentWindowSize + w] = window[w][d];
+                            decoderInput[d * currentWindowSize + w] = state[d];
                         }
                     }
 
                     const decoderOutputs = await this.decoderSession.run({
-                        [this.decoderSession.inputNames[0]]: new ort.Tensor('float32', decoderInput, [1, 512, currentWindowSize])
+                        [decoderInputName]: new ort.Tensor('float32', decoderInput, [1, 512, currentWindowSize])
                     });
 
-                    const audio = decoderOutputs[this.decoderSession.outputNames[0]].data;
+                    const audio = decoderOutputs[decoderOutputName].data;
 
                     let audioChunk;
                     if (finished) {
